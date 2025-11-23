@@ -1,0 +1,1198 @@
+/**
+ * Full-featured WhatsApp bot (Baileys / "@whiskeysockets/baileys" package)
+ * - Put this file as bot.js in your project root
+ * - Uses config.json in project root and data/ for persistent files
+ *
+ * Requirements:
+ * npm install @whiskeysockets/baileys qrcode-terminal ytdl-core yt-search pino fs-extra openai dotenv
+ *
+ * Notes:
+ * - Use PM2 / Railway / process manager for reliable restart on .restart
+ * - This file uses multi-file auth at ./data/auth (created automatically)
+ */
+
+import * as baileys from "@whiskeysockets/baileys";
+const {
+  default: makeWASocket,
+  useMultiFileAuthState,
+  downloadContentFromMessage,
+  DisconnectReason,
+  makeInMemoryStore: nativeMakeInMemoryStore,
+} = baileys;
+
+import qrcode from "qrcode-terminal";
+import fs from "fs";
+import fse from "fs-extra";
+import path from "path";
+import { performance } from "perf_hooks";
+import ytdl from "ytdl-core";
+import yts from "yt-search";   // used in your code as `yts(...)`
+import ytpl from "ytpl";       // for playlist support
+import pino from "pino";
+import dotenv from "dotenv";
+import OpenAI from "openai";
+
+dotenv.config();
+
+// create a fallback minimal in-memory store if the library does not export one
+const makeInMemoryStore =
+  nativeMakeInMemoryStore ||
+  ((logger) => {
+    const contacts = {};
+    return {
+      contacts,
+      bind: (ev) => {
+        if (!ev || typeof ev.on !== "function") return;
+        ev.on("contacts.upsert", (upd) => {
+          try {
+            for (const u of upd) {
+              if (u?.id) contacts[u.id] = u;
+            }
+          } catch (e) {}
+        });
+        ev.on("contacts.update", (upd) => {
+          try {
+            for (const u of upd) {
+              if (u?.id) contacts[u.id] = { ...(contacts[u.id] || {}), ...u };
+            }
+          } catch (e) {}
+        });
+      },
+    };
+  });
+
+// ---- Config / Data files ----
+const ROOT = process.cwd();
+const DATA_DIR = path.join(ROOT, "data");
+const AUTH_DIR = path.join(DATA_DIR, "auth");
+const SUDO_FILE = path.join(DATA_DIR, "sudo.json");
+const BANNED_FILE = path.join(DATA_DIR, "banned.json");
+const CONFIG_FILE = path.join(ROOT, "config.json");
+
+// ensure directories/files
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+if (!fs.existsSync(SUDO_FILE))
+  fs.writeFileSync(SUDO_FILE, JSON.stringify([/* owner will be added below */], null, 2));
+if (!fs.existsSync(BANNED_FILE)) fs.writeFileSync(BANNED_FILE, JSON.stringify([], null, 2));
+if (!fs.existsSync(CONFIG_FILE)) {
+  // safe default config if missing
+  fs.writeFileSync(
+    CONFIG_FILE,
+    JSON.stringify(
+      {
+        owner: "2349065494753@s.whatsapp.net",
+        prefix: ".",
+        modePublic: true,
+        autoReplyCooldownMs: 5 * 60 * 1000,
+        maxFileSizeBytes: 25 * 1024 * 1024,
+        botName: "MyWhatsAppBot",
+        botStatus: "Online",
+      },
+      null,
+      2
+    )
+  );
+}
+
+// ---- load config & data (safe fallback) ----
+let config = {};
+try {
+  config = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+} catch (e) {
+  console.error("Failed to load config.json — creating safe defaults.", e);
+  config = {
+    owner: "2349065494753@s.whatsapp.net",
+    prefix: ".",
+    modePublic: true,
+    autoReplyCooldownMs: 5 * 60 * 1000,
+    maxFileSizeBytes: 25 * 1024 * 1024,
+    botName: "MyWhatsAppBot",
+    botStatus: "Online",
+  };
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+let sudoList = [];
+let bannedList = [];
+try {
+  sudoList = JSON.parse(fs.readFileSync(SUDO_FILE, "utf8"));
+  if (!Array.isArray(sudoList)) sudoList = [];
+} catch (e) {
+  sudoList = [];
+}
+try {
+  bannedList = JSON.parse(fs.readFileSync(BANNED_FILE, "utf8"));
+  if (!Array.isArray(bannedList)) bannedList = [];
+} catch (e) {
+  bannedList = [];
+}
+
+// ensure owner in sudoList
+if (!sudoList.includes(config.owner)) {
+  sudoList.unshift(config.owner);
+  try { fs.writeFileSync(SUDO_FILE, JSON.stringify(sudoList, null, 2)); } catch (e) {}
+}
+
+// --- Normalization / identity helpers (PLACE HERE) ---
+// normalize JID to ignore device/resource suffix like ':59'
+function normalizeJid(jid) {
+  if (!jid) return jid;
+  try {
+    const s = String(jid);
+    return s.split(":")[0].trim();
+  } catch (e) {
+    return jid;
+  }
+}
+
+const isOwner = (jid) => normalizeJid(jid) === normalizeJid(config.owner);
+
+const isSudo = (jid) => {
+  const norm = normalizeJid(jid);
+  return sudoList.map(normalizeJid).includes(norm) || isOwner(jid);
+};
+
+const isBanned = (jid) => {
+  const norm = normalizeJid(jid);
+  return bannedList.map(normalizeJid).includes(norm);
+};
+
+// helpers to persist
+const saveSudo = () => fs.writeFileSync(SUDO_FILE, JSON.stringify(sudoList, null, 2));
+const saveBanned = () => fs.writeFileSync(BANNED_FILE, JSON.stringify(bannedList, null, 2));
+const saveConfig = () => fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+
+// jid formatting helper (keep this after normalization helpers)
+const jidFromNumber = (num) => {
+  if (!num) return null;
+  const digits = ("" + num).replace(/[^\d+]/g, "");
+  let n = digits;
+  if (n.startsWith("+")) n = n.slice(1);
+  if (n.length === 11 && n.startsWith("0")) n = "234" + n.slice(1);
+  return `${n}@s.whatsapp.net`;
+};
+
+// --- THEN create store and the rest of the file ---
+// in-memory store (helpful) — single declaration only
+const store = makeInMemoryStore(pino().child({ level: "silent" }));
+
+// Globals for socket + flags
+let sock = null;
+let reconnecting = false;
+let botReady = false; // ensure startup message only once
+let processedMessages = new Map(); // dedupe
+let contactCooldowns = new Map(); // auto-reply cooldowns
+
+// cleanup intervals
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, ts] of processedMessages.entries()) {
+    if (now - ts > 10 * 60 * 1000) processedMessages.delete(k); // 10 min TTL
+  }
+  for (const [jid, ts] of contactCooldowns.entries()) {
+    if (now - ts > config.autoReplyCooldownMs * 3) contactCooldowns.delete(jid);
+  }
+}, 60 * 1000);
+
+// safe send message wrapper
+async function safeSend(jid, msg) {
+  try {
+    if (!sock) throw new Error("Socket not ready");
+    return await sock.sendMessage(jid, msg);
+  } catch (err) {
+    console.error("safeSend error:", err?.message ?? err);
+  }
+}
+
+// get bot id helper
+function getBotJid() {
+  return sock?.user?.id || (sock?.authState && sock.authState.creds?.me?.id) || config.owner;
+}
+
+// helper: check bot admin
+async function isBotAdminInGroup(groupJid) {
+  try {
+    const meta = await sock.groupMetadata(groupJid);
+    const me = getBotJid();
+    const p = meta.participants.find((x) => x.id === me);
+    return !!(p && (p.admin || p.isAdmin || p.isSuperAdmin));
+  } catch (e) {
+    console.warn("isBotAdminInGroup error:", e?.message ?? e);
+    return false;
+  }
+}
+
+// utility: friendly date
+function friendlyDate(ts) {
+  try {
+    if (!ts) return "—";
+    const d = new Date(Number(ts));
+    if (isNaN(d.getTime())) return "—";
+    return d.toISOString(); // user earlier wanted exact dates — ISO is explicit
+  } catch (e) {
+    return "—";
+  }
+}
+
+// main start function
+async function startBot() {
+  // avoid spawning multiple socket instances
+  if (sock && sock?.ws?.readyState && sock.ws.readyState !== 2 && sock.ws.readyState !== 3) {
+    console.log("Socket already active; skipping new start.");
+    return;
+  }
+
+  reconnecting = false;
+  botReady = false;
+
+  // create auth state
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+
+  // create socket
+  sock = makeWASocket({
+    logger: pino({ level: "silent" }),
+    auth: state,
+    // explicit browser description
+    browser: ["MyWhatsAppBot", "Chrome", "1.0"],
+    printQRInTerminal: false, // we handle QR in connection.update event
+  });
+
+  // bind store
+  store.bind(sock.ev);
+
+  // save creds when updated
+  sock.ev.on("creds.update", saveCreds);
+
+ // connection.update handler (robust)
+sock.ev.on("connection.update", async (update) => {
+  try {
+    const { connection, lastDisconnect, qr } = update;
+
+    // if QR present print it as ascii + URL
+    if (qr) {
+      qrcode.generate(qr, { small: true });
+      console.log("Larger QR link (open in browser to scan):");
+      console.log(
+        "https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" +
+          encodeURIComponent(qr)
+      );
+    }
+
+    if (connection === "open") {
+      console.log("✅ WhatsApp connection OPEN");
+// show which JID we are logged in as (helpful to diagnose owner mismatches)
+const loggedInJid =
+  sock?.user?.id || (sock?.authState && sock.authState.creds?.me?.id) || null;
+console.log("Logged in as (socket JID):", loggedInJid);
+console.log("Configured owner (config.owner):", config.owner);
+
+if (loggedInJid && config.owner) {
+  // Normalize both JIDs by removing any device suffix like ":59"
+  const cleanLoggedIn = loggedInJid.replace(/:\d+/, "");
+  const cleanOwner = config.owner.replace(/:\d+/, "");
+
+  if (cleanLoggedIn !== cleanOwner) {
+    console.warn(
+      "⚠️ Owner mismatch: scanned account differs from config.owner (ignoring device suffixes)."
+    );
+  } else {
+    console.log("✅ Owner match verified (device suffix ignored).");
+  }
+}
+
+
+      // send startup message once
+      if (!botReady) {
+        botReady = true;
+        try {
+          await safeSend(config.owner, { text: `🤖 ${config.botName} is online!` });
+        } catch (e) {
+          // Do not throw — just warn so connection handler stays healthy
+          console.warn("Failed to deliver startup message to configured owner:", e?.message ?? e);
+        }
+      }
+    } else if (connection === "close") {
+      // determine reason
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = reason === DisconnectReason.loggedOut || reason === 401;
+      console.warn("Connection closed. Reason:", reason, "loggedOut:", loggedOut);
+
+      botReady = false;
+
+      if (loggedOut) {
+        // credentials invalid - owner must rescan QR manually
+        console.error("Logged out. Delete ./data/auth and rescan QR.");
+        try {
+          await safeSend(config.owner, { text: "❌ Bot logged out. Please rescan QR and restart." });
+        } catch (e) {
+          // ignore send errors
+        }
+        return;
+      }
+
+      // transient disconnect - reconnect once with guard
+      if (!reconnecting) {
+        reconnecting = true;
+        console.log("Attempt reconnect in 3s...");
+        setTimeout(async () => {
+          try {
+            // Remove listeners and clear sock to allow fresh create
+            try {
+              sock.ev.removeAllListeners();
+            } catch (e) {
+              /* ignore */
+            }
+            sock = null;
+            await startBot();
+          } catch (e) {
+            console.error("Reconnect failed:", e?.message ?? e);
+          } finally {
+            reconnecting = false;
+          }
+        }, 3000);
+      } else {
+        console.log("Already reconnecting, skipping spawn.");
+      }
+    }
+  } catch (e) {
+    console.error("connection.update handler error:", e?.message ?? e);
+  }
+});
+// messages.upsert
+sock.ev.on("messages.upsert", async ({ messages }) => {
+  try {
+    const msg = messages?.[0];
+    if (!msg || !msg.message) return;
+
+    // ignore messages without proper key or remoteJid
+    if (!msg.key || !msg.key.remoteJid) return;
+
+    // chat identifiers
+    const remoteJid = msg.key.remoteJid; // group JID or private JID (chat where the message appeared)
+    const isGroup = remoteJid.endsWith("@g.us");
+
+    // actual sender: participant in groups, remoteJid for private
+    const authorJid = msg.key.participant || remoteJid;
+
+    // chat destination when replying
+    const sender = remoteJid;
+
+    // logged-in socket account JID (may include device suffix)
+    const loggedInJid = sock?.user?.id || (sock?.authState && sock.authState.creds?.me?.id) || null;
+
+    // Prevent loops: ignore messages created by this socket account UNLESS the logged-in account is configured owner
+    // (so owner controlling from same number works)
+    if (msg.key.fromMe && loggedInJid && normalizeJid(loggedInJid) !== normalizeJid(config.owner)) {
+      // message came from the bot account but that account isn't the configured owner — ignore
+      return;
+    }
+
+    // dedupe
+    const msgId = msg.key.id || `${remoteJid}_${Date.now()}`;
+    if (processedMessages.has(msgId)) return;
+    processedMessages.set(msgId, Date.now());
+
+    // extract text
+    const text =
+      msg.message.conversation ??
+      msg.message.extendedTextMessage?.text ??
+      msg.message.imageMessage?.caption ??
+      msg.message.videoMessage?.caption ??
+      "";
+
+    // nice debug
+    console.log(`[${isGroup ? "GROUP" : "PRIVATE"}] ${authorJid}: ${text}`);
+
+    // ignore banned senders (use authorJid)
+    if (isBanned(authorJid)) {
+      console.log("Sender banned:", authorJid);
+      return;
+    }
+
+    // Auto-reply in private: only to unknown (unsaved) contacts and with cooldown.
+    if (!isGroup) {
+      try {
+        const contactEntry = (store.contacts && store.contacts[authorJid]) || null;
+        const contactKnown = !!(contactEntry && (contactEntry.name || contactEntry.notify));
+        if (!contactKnown) {
+          const last = contactCooldowns.get(authorJid) || 0;
+          if (Date.now() - last >= (config.autoReplyCooldownMs || 5 * 60 * 1000)) {
+            await safeSend(sender, { text: "Hello 👋 — I am currently away. I will reply when possible." });
+            contactCooldowns.set(authorJid, Date.now());
+          }
+        }
+      } catch (e) {
+        console.warn("auto-reply check error:", e?.message ?? e);
+      }
+    }
+
+    // === permission checks & command parsing will come after this block ===
+    // Continue with your existing "view-once" handling and command parsing, but
+    // make sure to use `sender` when sending back to the chat, and `authorJid`
+    // for permission checks (owner/sudo).
+
+      // Auto-reply policy: only for private chats AND only for unknown numbers (not saved contacts)
+      if (!isGroup) {
+        const last = contactCooldowns.get(authorJid) || 0;
+        // determine if contact is saved using store.contacts or sock.contacts
+        const knownContact =
+          (store.contacts && Object.keys(store.contacts).some(k => k === authorJid)) ||
+          (sock.contacts && Object.keys(sock.contacts).some(k => k === authorJid));
+        if (!knownContact && Date.now() - last >= (config.autoReplyCooldownMs || 5 * 60 * 1000)) {
+          try {
+            await safeSend(remoteJid, { text: "Hello 👋 — I am currently away. I will reply when possible." });
+            contactCooldowns.set(authorJid, Date.now());
+          } catch (e) {
+            // ignore send errors
+          }
+        }
+      }
+
+      // handle view-once messages automatically (both v1 and v2 fields) — keep existing behavior
+      const viewOnceMessage =
+        msg.message.viewOnceMessageV2 ?? msg.message.viewOnceMessageV2Extension ?? msg.message.viewOnceMessage;
+      if (viewOnceMessage) {
+        try {
+          const inner = viewOnceMessage.message ?? viewOnceMessage;
+          const typeKey = Object.keys(inner)[0];
+          const stream = await downloadContentFromMessage(inner[typeKey], typeKey.replace("Message", ""));
+          const parts = [];
+          for await (const chunk of stream) parts.push(chunk);
+          const ext = typeKey.toLowerCase().includes("image") ? "jpg" : "mp4";
+          const filename = path.join(DATA_DIR, `viewonce_${Date.now()}.${ext}`);
+          fs.writeFileSync(filename, Buffer.concat(parts));
+          console.log("Saved view-once as", filename);
+
+          // send actual media back to user so they can view the saved copy
+          try {
+            if (ext === "jpg") {
+              await safeSend(remoteJid, { image: fs.createReadStream(filename), caption: "✅ Saved view-once image" });
+            } else {
+              await safeSend(remoteJid, { video: fs.createReadStream(filename), caption: "✅ Saved view-once video" });
+            }
+          } catch (e) {
+            // ignore send errors
+          }
+
+          // cleanup
+          setTimeout(() => {
+            try {
+              fs.unlinkSync(filename);
+            } catch (e) {}
+          }, 60 * 1000);
+        } catch (e) {
+          console.error("view-once save error:", e?.message ?? e);
+        }
+      }
+
+      // command path: requires prefix
+      const prefix = (config.prefix || ".").toString();
+      if (!text || !text.trim().startsWith(prefix)) return;
+
+      const args = text.trim().slice(prefix.length).trim().split(/\s+/);
+      const cmdRaw = (args.shift() || "").toLowerCase();
+      const cmd = cmdRaw;
+      const argStr = args.join(" ").trim();
+
+    // ---------- PERMISSION CHECK ----------
+    // Determine whether this author is allowed to run commands
+    const allowed = config.modePublic ? true : (isOwnerJid(authorJid) || isSudoJid(authorJid));
+    if (!allowed) {
+      // silently ignore if private and not authorized
+      return;
+    }
+
+    // helper require functions using authorJid, and replies to the chat (sender)
+    const requireOwner = async () => {
+      if (!isOwnerJid(authorJid)) {
+        await safeSend(sender, { text: "⚠️ Owner-only command." }).catch(()=>{});
+        throw "not_owner";
+      }
+    };
+    const requireSudo = async () => {
+      if (!isSudoJid(authorJid)) {
+        await safeSend(sender, { text: "⚠️ Sudo-only command." }).catch(()=>{});
+        throw "not_sudo";
+      }
+    };
+
+      // ==== COMMANDS ====
+      // PING
+      if (cmd === "ping") {
+        try {
+          const t0 = performance.now();
+          await safeSend(remoteJid, { text: "🏓 Pinging..." });
+          const t1 = performance.now();
+          const latency = (t1 - t0).toFixed(2);
+          await safeSend(remoteJid, { text: `✅ Pong! Response time: ${latency} ms` });
+        } catch (e) {
+          console.error("ping error", e);
+        }
+        return;
+      }
+
+     // MENU (user details)
+if (cmd === "menu") {
+  try {
+    const target = msg.message.extendedTextMessage?.contextInfo?.participant || authorJid;
+    const contact = (store.contacts && store.contacts[target]) || {};
+    const displayName = contact?.name || contact?.notify || "Unknown";
+    let profilePicUrl = null;
+    try {
+      profilePicUrl = await sock.profilePictureUrl(target).catch(() => null);
+    } catch {}
+    let joined = "—";
+    if (isGroup) {
+      try {
+        const meta = await sock.groupMetadata(remoteJid);
+        const participant = meta.participants.find((p) => p.id === target);
+        if (participant?.joinedTimestamp) {
+          const dt = new Date(participant.joinedTimestamp);
+          joined = dt.toLocaleString("en-GB", { timeZone: "Africa/Lagos" });
+        }
+      } catch (e) {}
+    }
+
+    const menuText = [
+      `*👤 User Menu*`,
+      `*Name:* ${displayName}`,
+      `*JID:* ${target}`,
+      `*Group:* ${isGroup ? "Yes" : "No"}`,
+      `*Joined:* ${joined}`,
+      `*Saved Contact:* ${contact?.name ? "Yes" : "No"}`
+    ].join("\n");
+
+    if (profilePicUrl) {
+      try {
+        await sock.sendMessage(sender, { image: { url: profilePicUrl }, caption: menuText });
+        return;
+      } catch (e) {
+        // fallback to text
+      }
+    }
+
+    await safeSend(sender, { text: menuText });
+  } catch (e) {
+    console.error("menu error", e);
+    await safeSend(sender, { text: "⚠️ Failed to fetch user menu." });
+  }
+  return;
+}
+
+
+      // HELP
+      if (cmd === "help") {
+        const helpText = [
+          `*${config.botName} - Help*`,
+          ``,
+          `${prefix}ping — latency`,
+          `${prefix}menu — user info`,
+          `${prefix}tag / ${prefix}tagall — mention everyone in group`,
+          `${prefix}kick <num> / reply with ${prefix}kick — remove member (bot admin required)`,
+          `${prefix}invite <num> — add user to group (bot admin required)`,
+          `${prefix}download — reply to media to save and resend`,
+          `${prefix}song <query> — download YouTube audio (may be limited by file size)`,
+          `${prefix}uptime | ${prefix}runtime — bot uptime`,
+          `${prefix}sudo — sudo-only menu`,
+        ].join("\n");
+        await safeSend(remoteJid, { text: helpText });
+        return;
+      }
+
+      // UPTIME / RUNTIME
+      if (cmd === "uptime" || cmd === "runtime") {
+        const up = process.uptime();
+        const hrs = Math.floor(up / 3600);
+        const mins = Math.floor((up % 3600) / 60);
+        const secs = Math.floor(up % 60);
+        await safeSend(remoteJid, { text: `⏱ Uptime: ${hrs}h ${mins}m ${secs}s` });
+        return;
+      }
+
+      // TAG / TAGALL
+      if ((cmd === "tag" || cmd === "tagall") && isGroup) {
+        try {
+          const meta = await sock.groupMetadata(remoteJid);
+          const participants = meta.participants.map((p) => p.id);
+          if (!participants.length) {
+            await safeSend(remoteJid, { text: "No participants found." });
+            return;
+          }
+          const mentionText = participants.map((id) => `@${id.split("@")[0]}`).join(" ");
+          await sock.sendMessage(remoteJid, { text: `📢 Tagging everyone:\n${mentionText}`, mentions: participants });
+        } catch (e) {
+          console.error("tag error", e);
+          await safeSend(remoteJid, { text: "⚠️ Could not tag members." });
+        }
+        return;
+      }
+
+      // KICK
+      if (cmd === "kick" && isGroup) {
+        try {
+          // ensure bot admin
+          const botIsAdmin = await isBotAdminInGroup(remoteJid);
+          if (!botIsAdmin) {
+            await safeSend(remoteJid, { text: "⚠️ I must be group admin to remove members." });
+            return;
+          }
+          let targetJid = null;
+          if (argStr) {
+            targetJid = jidFromNumber(argStr);
+          } else {
+            targetJid = msg.message.extendedTextMessage?.contextInfo?.participant;
+          }
+          if (!targetJid) {
+            await safeSend(remoteJid, { text: `Usage: ${prefix}kick <234XXXXXXXXXX> or reply to user's message with ${prefix}kick` });
+            return;
+          }
+          await sock.groupParticipantsUpdate(remoteJid, [targetJid], "remove");
+          await safeSend(remoteJid, { text: `✅ Removed: ${targetJid}` });
+        } catch (e) {
+          console.error("kick error", e);
+          await safeSend(remoteJid, { text: `⚠️ Kick failed: ${e?.message ?? e}` });
+        }
+        return;
+      }
+
+      // INVITE / ADD
+      if (cmd === "invite" && isGroup) {
+        try {
+          const botIsAdmin = await isBotAdminInGroup(remoteJid);
+          if (!botIsAdmin) {
+            await safeSend(remoteJid, { text: "⚠️ I must be group admin to add members." });
+            return;
+          }
+          if (!argStr) {
+            await safeSend(remoteJid, { text: `Usage: ${prefix}invite 234XXXXXXXXXX` });
+            return;
+          }
+          const j = jidFromNumber(argStr);
+          if (!j) {
+            await safeSend(remoteJid, { text: "Invalid number." });
+            return;
+          }
+          await sock.groupParticipantsUpdate(remoteJid, [j], "add");
+          await safeSend(remoteJid, { text: `✅ Invited/added: ${j}` });
+        } catch (e) {
+          console.error("invite error", e);
+          await safeSend(remoteJid, { text: `⚠️ Invite failed: ${e?.message ?? e}` });
+        }
+        return;
+      }
+
+      // DOWNLOAD (reply to media to save and send back)
+      if (cmd === "download") {
+        try {
+          const ctx = msg.message.extendedTextMessage?.contextInfo;
+          const quoted = ctx?.quotedMessage;
+          if (!quoted) {
+            await safeSend(remoteJid, { text: "Reply to a media message with .download" });
+            return;
+          }
+          const mtype = Object.keys(quoted)[0]; // imageMessage, videoMessage, documentMessage, audioMessage
+          const stream = await downloadContentFromMessage(quoted[mtype], mtype.replace("Message", ""));
+          const parts = [];
+          for await (const chunk of stream) parts.push(chunk);
+          const ext = mtype.toLowerCase().includes("image") ? "jpg" : mtype.toLowerCase().includes("video") ? "mp4" : "bin";
+          const filename = path.join(DATA_DIR, `download_${Date.now()}.${ext}`);
+          fs.writeFileSync(filename, Buffer.concat(parts));
+          // send file back as media
+          if (ext === "jpg") {
+            await safeSend(remoteJid, { image: fs.createReadStream(filename), caption: `✅ Downloaded: ${path.basename(filename)}` });
+          } else if (ext === "mp4") {
+            await safeSend(remoteJid, { video: fs.createReadStream(filename), caption: `✅ Downloaded: ${path.basename(filename)}` });
+          } else {
+            await safeSend(remoteJid, { document: fs.createReadStream(filename), fileName: path.basename(filename) });
+          }
+          setTimeout(() => {
+            try {
+              fs.unlinkSync(filename);
+            } catch (e) {}
+          }, 60 * 1000);
+        } catch (e) {
+          console.error("download error", e);
+          await safeSend(remoteJid, { text: `⚠️ Download failed: ${e?.message ?? e}` });
+        }
+        return;
+      }
+
+     // SONG - YouTube search + download audio (ytdl-core + yt-search)
+if (cmd === "song") {
+  if (!argStr) { await safeSend(sender, { text: `Usage: ${prefix}song <search terms>` }); return; }
+  try {
+    await safeSend(sender, { text: `🔎 Searching YouTube for "${argStr}"...` });
+    const r = await yts(argStr);
+    const v = r?.videos?.[0];
+    if (!v) { await safeSend(sender, { text: "No results found." }); return; }
+    const url = v.url;
+    const titleSafe = v.title.replace(/[^\w\s-]/g, "").slice(0, 64).replace(/\s+/g, "_");
+    const filename = path.join(DATA_DIR, `song_${Date.now()}_${titleSafe}.mp3`);
+
+    // ytdl may break depending on YouTube changes — see earlier errors in logs
+    const stream = ytdl(url, { filter: "audioonly", quality: "highestaudio" });
+    const ws = fs.createWriteStream(filename);
+    stream.pipe(ws);
+
+    ws.on("finish", async () => {
+      try {
+        const stats = fs.statSync(filename);
+        if (stats.size > (config.maxFileSizeBytes || 25 * 1024 * 1024)) {
+          fs.unlinkSync(filename);
+          await safeSend(sender, { text: `⚠️ File too large to send (${(stats.size/1024/1024).toFixed(2)} MB).` });
+          return;
+        }
+        await safeSend(sender, { audio: fs.createReadStream(filename) });
+      } catch (e) {
+        console.error("song send error", e);
+        await safeSend(sender, { text: "⚠️ Failed to send song." });
+      } finally {
+        try { fs.unlinkSync(filename); } catch (e) {}
+      }
+    });
+
+    ws.on("error", async (e) => {
+      console.error("yt write error", e);
+      await safeSend(sender, { text: "⚠️ Failed to download audio." });
+      try { if (fs.existsSync(filename)) fs.unlinkSync(filename); } catch (e) {}
+    });
+  } catch (e) {
+    console.error("song error", e);
+    await safeSend(sender, { text: `⚠️ Song error: ${e?.message ?? e}` });
+  }
+  return;
+}
+
+
+// ✅ SUDO MANAGEMENT COMMANDS
+if (cmd === "setsudo") {
+  await requireOwner(); // only owner can add sudo users
+  if (!args[0]) return safeSend(remoteJid, { text: "Usage: .setsudo <number>" });
+
+  const num = args[0].replace(/\D/g, "") + "@s.whatsapp.net";
+
+  let sudoList = [];
+  if (fs.existsSync("./sudo.json")) {
+    sudoList = JSON.parse(fs.readFileSync("./sudo.json", "utf8") || "[]");
+  }
+  if (!sudoList.includes(num)) sudoList.push(num);
+
+  fs.writeFileSync("./sudo.json", JSON.stringify(sudoList, null, 2));
+  await safeSend(remoteJid, { text: `✅ Added ${num} as sudo user.` });
+  return;
+}
+
+if (cmd === "delsudo") {
+  await requireOwner(); // only owner can remove sudo
+  if (!args[0]) return safeSend(remoteJid, { text: "Usage: .delsudo <number>" });
+
+  const num = args[0].replace(/\D/g, "") + "@s.whatsapp.net";
+
+  let sudoList = [];
+  if (fs.existsSync("./sudo.json")) {
+    sudoList = JSON.parse(fs.readFileSync("./sudo.json", "utf8") || "[]");
+  }
+
+  sudoList = sudoList.filter(u => normalizeJid(u) !== normalizeJid(num));
+  fs.writeFileSync("./sudo.json", JSON.stringify(sudoList, null, 2));
+
+  await safeSend(remoteJid, { text: `❌ Removed ${num} from sudo list.` });
+  return;
+}
+
+if (cmd === "getsudo") {
+  await requireOwner(); // only owner can view sudo list
+
+  let sudoList = [];
+  if (fs.existsSync("./sudo.json")) {
+    sudoList = JSON.parse(fs.readFileSync("./sudo.json", "utf8") || "[]");
+  }
+
+  if (sudoList.length === 0) {
+    await safeSend(remoteJid, { text: "No sudo users set." });
+  } else {
+    await safeSend(remoteJid, { text: `👑 Sudo users:\n${sudoList.join("\n")}` });
+  }
+  return;
+}
+
+// MODE public/private (owner only)
+if (cmd === "mode") {
+  try {
+    await requireOwner();
+  } catch {
+    return;
+  }
+
+  if (!argStr) {
+    await safeSend(remoteJid, { text: `Usage: ${prefix}mode public|private` });
+    return;
+  }
+
+  const m = argStr.toLowerCase();
+  if (m === "public") config.modePublic = true;
+  else if (m === "private") config.modePublic = false;
+  else {
+    await safeSend(remoteJid, { text: "Invalid. Use public or private." });
+    return;
+  }
+
+  saveConfig();
+  await safeSend(remoteJid, { text: `✅ Mode set to ${m}` });
+  return;
+}
+
+
+      // SETPREFIX (owner only)
+      if (cmd === "setprefix") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        if (!argStr) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}setprefix <symbol>` });
+          return;
+        }
+        config.prefix = argStr;
+        saveConfig();
+        await safeSend(remoteJid, { text: `✅ Prefix set to "${argStr}"` });
+        return;
+      }
+
+      // BAN / UNBAN (sudo)
+      if (cmd === "ban") {
+        try {
+          await requireSudo();
+        } catch {
+          return;
+        }
+        let target = null;
+        if (argStr) target = jidFromNumber(argStr);
+        else target = msg.message.extendedTextMessage?.contextInfo?.participant;
+        if (!target) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}ban <number> or reply with ${prefix}ban` });
+          return;
+        }
+        if (!bannedList.includes(target)) {
+          bannedList.push(target);
+          saveBanned();
+        }
+        await safeSend(remoteJid, { text: `⛔ Banned ${target}` });
+        return;
+      }
+      if (cmd === "unban") {
+        try {
+          await requireSudo();
+        } catch {
+          return;
+        }
+        let target = null;
+        if (argStr) target = jidFromNumber(argStr);
+        else target = msg.message.extendedTextMessage?.contextInfo?.participant;
+        if (!target) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}unban <number> or reply with ${prefix}unban` });
+          return;
+        }
+        bannedList = bannedList.filter((x) => x !== target);
+        saveBanned();
+        await safeSend(remoteJid, { text: `✅ Unbanned ${target}` });
+        return;
+      }
+
+      // BLOCK / UNBLOCK (sudo) - may not be supported in all Baileys versions
+      if (cmd === "block" || cmd === "unblock") {
+        try {
+          await requireSudo();
+        } catch {
+          return;
+        }
+        let target = null;
+        if (argStr) target = jidFromNumber(argStr);
+        else target = msg.message.extendedTextMessage?.contextInfo?.participant;
+        if (!target) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}${cmd} <number> or reply with ${prefix}${cmd}` });
+          return;
+        }
+        try {
+          if (cmd === "block") await sock.updateBlockStatus(target, "block");
+          else await sock.updateBlockStatus(target, "unblock");
+          await safeSend(remoteJid, { text: `✅ ${cmd === "block" ? "Blocked" : "Unblocked"} ${target}` });
+        } catch (e) {
+          console.warn("block/unblock not supported:", e?.message ?? e);
+          await safeSend(remoteJid, { text: "⚠️ Could not block/unblock (API may not support it)." });
+        }
+        return;
+      }
+
+      // SETNAMEBOT / SETSTATUSBOT / SETPPBOT (owner)
+      if (cmd === "setnamebot") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        if (!argStr) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}setnamebot <name>` });
+          return;
+        }
+        config.botName = argStr;
+        saveConfig();
+        await safeSend(remoteJid, { text: `✅ Bot name saved locally: ${argStr}` });
+        return;
+      }
+      if (cmd === "setstatusbot") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        if (!argStr) {
+          await safeSend(remoteJid, { text: `Usage: ${prefix}setstatusbot <bio>` });
+          return;
+        }
+        config.botStatus = argStr;
+        saveConfig();
+        await safeSend(remoteJid, { text: `✅ Bot status saved locally: ${argStr}` });
+        return;
+      }
+      if (cmd === "setppbot") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        const ctx = msg.message.extendedTextMessage?.contextInfo;
+        const quoted = ctx?.quotedMessage;
+        if (!quoted || !quoted.imageMessage) {
+          await safeSend(remoteJid, { text: `Reply to an image with ${prefix}setppbot` });
+          return;
+        }
+        try {
+          const stream = await downloadContentFromMessage(quoted.imageMessage, "image");
+          const parts = [];
+          for await (const c of stream) parts.push(c);
+          const file = path.join(DATA_DIR, `ppbot_${Date.now()}.jpg`);
+          fs.writeFileSync(file, Buffer.concat(parts));
+          // try update profile picture (if supported)
+          try {
+            if (typeof sock.updateProfilePicture === "function") {
+              await sock.updateProfilePicture(file);
+              await safeSend(remoteJid, { text: "✅ Bot profile picture updated." });
+            } else {
+              await safeSend(remoteJid, { text: `✅ Saved PP to server: ${file} (API does not support programmatic update).` });
+            }
+          } catch (err) {
+            console.warn("setppbot API error:", err?.message ?? err);
+            await safeSend(remoteJid, { text: `✅ Saved PP file locally: ${file}` });
+          }
+          setTimeout(() => {
+            try {
+              fs.unlinkSync(file);
+            } catch (e) {}
+          }, 60 * 1000);
+        } catch (e) {
+          console.error("setppbot error", e);
+          await safeSend(remoteJid, { text: "⚠️ Failed to set profile picture." });
+        }
+        return;
+      }
+
+      // RESTART / SHUTDOWN (owner)
+      if (cmd === "restart") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        await safeSend(remoteJid, { text: "♻️ Restarting bot..." });
+        console.log("Owner requested restart. Exiting process.");
+        process.exit(0); // process manager should restart
+      }
+      if (cmd === "shutdown") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        await safeSend(remoteJid, { text: "⏹️ Shutting down..." });
+        console.log("Owner requested shutdown. Exiting.");
+        process.exit(0);
+      }
+
+      // EVAL (owner) - very powerful, use carefully
+      if (cmd === "eval") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        if (!argStr) {
+          await safeSend(remoteJid, { text: "Usage: .eval <js>" });
+          return;
+        }
+        try {
+          // eslint-disable-next-line no-eval
+          const output = eval(argStr);
+          await safeSend(remoteJid, { text: `✅ Eval result:\n${String(output).slice(0, 1500)}` });
+        } catch (e) {
+          await safeSend(remoteJid, { text: `⚠️ Eval error: ${e.message || e}` });
+        }
+        return;
+      }
+
+      // EXEC shell (owner)
+      if (cmd === "exec") {
+        try {
+          await requireOwner();
+        } catch {
+          return;
+        }
+        if (!argStr) {
+          await safeSend(remoteJid, { text: "Usage: .exec <cmd>" });
+          return;
+        }
+        try {
+          const { exec } = await import("child_process");
+          exec(argStr, { timeout: 30_000 }, async (err, stdout, stderr) => {
+            if (err) {
+              await safeSend(remoteJid, { text: `⚠️ Exec error: ${err.message}` });
+              return;
+            }
+            const out = (stdout || stderr || "—").slice(0, 1500);
+            await safeSend(remoteJid, { text: `📤 Output:\n${out}` });
+          });
+        } catch (e) {
+          await safeSend(remoteJid, { text: `⚠️ Exec failed: ${e.message || e}` });
+        }
+        return;
+      }
+
+      // === VIEW COMMAND (replacement for view-once manual fetch) ===
+      if (cmd === "view") {
+        // This command: reply to the view-once message, bot will try to download and resend
+        try {
+          const ctx = msg.message.extendedTextMessage?.contextInfo;
+          const quoted = ctx?.quotedMessage;
+          if (!quoted) {
+            await safeSend(remoteJid, { text: `Usage: Reply to a view-once image/video with ${prefix}view` });
+            return;
+          }
+          // possible types within quoted: viewOnceMessage or imageMessage with viewOnce flag
+          // Try to detect inner view-once container first
+          const v = quoted.viewOnceMessage ?? quoted; // if quoted is viewOnceMessage structure else the quoted itself
+          const typeKey = Object.keys(v)[0];
+          // If the quoted contains a view once container
+          if (v.viewOnceMessage || v.view_once) {
+            // handle earlier automatic structure
+          }
+
+          // Attempt to download whatever media is present
+          const mediaKey = Object.keys(quoted)[0];
+          if (!mediaKey) {
+            await safeSend(remoteJid, { text: "⚠️ No downloadable media found in the replied message." });
+            return;
+          }
+          const stream = await downloadContentFromMessage(quoted[mediaKey], mediaKey.replace("Message", ""));
+          const parts = [];
+          for await (const chunk of stream) parts.push(chunk);
+          const ext = mediaKey.toLowerCase().includes("image") ? "jpg" : mediaKey.toLowerCase().includes("video") ? "mp4" : "bin";
+          const filename = path.join(DATA_DIR, `view_manual_${Date.now()}.${ext}`);
+          fs.writeFileSync(filename, Buffer.concat(parts));
+
+          // resend the file
+          if (ext === "jpg") {
+            await safeSend(remoteJid, { image: fs.createReadStream(filename), caption: "✅ Saved view media" });
+          } else if (ext === "mp4") {
+            await safeSend(remoteJid, { video: fs.createReadStream(filename), caption: "✅ Saved view media" });
+          } else {
+            await safeSend(remoteJid, { document: fs.createReadStream(filename), fileName: path.basename(filename) });
+          }
+
+          setTimeout(() => {
+            try { fs.unlinkSync(filename); } catch (e) {}
+          }, 60 * 1000);
+        } catch (e) {
+          console.error("view command error:", e);
+          await safeSend(remoteJid, { text: "⚠️ Failed to retrieve view media." });
+        }
+        return;
+      }
+
+ // === GPT COMMAND ===
+if (cmd === "gpt") {
+  if (!argStr) {
+    await safeSend(sender, { text: `Usage: ${prefix}gpt <your question or image prompt>` });
+    return;
+  }
+
+  await safeSend(sender, { text: "🤖 Thinking..." });
+
+  try {
+    const key = process.env.OPENAI_API_KEY || config.openaiApiKey;
+    if (!key) {
+      await safeSend(sender, { text: "⚠️ Missing OpenAI API key. Set OPENAI_API_KEY in .env or config.openaiApiKey in config.json." });
+      return;
+    }
+
+    const openai = new OpenAI({ apiKey: key });
+
+    const lower = argStr.toLowerCase();
+    const wantsImage = /(draw|image|picture|illustrate|show|paint|design|create an image|generate)/.test(lower);
+
+    if (wantsImage) {
+      const imgResponse = await openai.images.generate({
+        model: "gpt-image-1",
+        prompt: argStr,
+        size: "512x512"
+      });
+
+      const imageUrl = imgResponse?.data?.[0]?.url;
+      if (imageUrl) {
+        await sock.sendMessage(sender, { image: { url: imageUrl }, caption: `🎨 *AI Image Generated:*\n${argStr}` });
+      } else {
+        await safeSend(sender, { text: "⚠️ Could not generate image." });
+      }
+    } else {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4o-mini",
+        messages: [
+          { role: "system", content: "You are a concise WhatsApp assistant." },
+          { role: "user", content: argStr }
+        ],
+        max_tokens: 800,
+        temperature: 0.7
+      });
+
+      const reply = (completion?.choices?.[0]?.message?.content || completion?.choices?.[0]?.text || "").trim();
+      await safeSend(sender, { text: reply || "🤔 No response received." });
+    }
+  } catch (err) {
+    console.error("GPT Error:", err?.message || err);
+    let reason = "⚠️ Sorry, I couldn’t get a response from ChatGPT.";
+    if (err?.message?.includes("quota") || err?.message?.includes("quota")) {
+      reason = "⚠️ OpenAI quota/error: check billing/plan.";
+    }
+    await safeSend(sender, { text: reason });
+  }
+
+  return;
+}
+
+      // unknown
+      await safeSend(remoteJid, { text: `❓ Unknown command "${cmd}". Type ${prefix}help` });
+    } catch (e) {
+      console.error("messages.upsert error:", e);
+    }
+  });
+
+  console.log("Bot started — waiting for messages.");
+}
+
+// start
+startBot().catch((err) => {
+  console.error("Fatal start error:", err);
+  process.exit(1);
+});
+

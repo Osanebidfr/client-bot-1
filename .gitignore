@@ -1,0 +1,12 @@
+
+# optional: ignore saved media & dbs
+data/*.db
+data/*.sqlite
+data/*.log
+data/saved/
+
+# node stuff
+node_modules/
+
+# env files (also don't push .env)
+.env

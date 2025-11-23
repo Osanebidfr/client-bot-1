@@ -1,0 +1,51 @@
+{
+  "owner": "2348087054385@s.whatsapp.net",
+  "admins": [
+    "2348087054385@s.whatsapp.net"
+  ],
+  "sudo": [
+    "2348087054385@s.whatsapp.net"
+  ],
+  "banned": [],
+  "permissions": {
+    "owner": [
+      "restart",
+      "shutdown",
+      "exec",
+      "eval",
+      "setsudo",
+      "delsudo",
+      "ban",
+      "unban"
+    ],
+    "sudo": [
+      "ban",
+      "unban",
+      "tagall",
+      "promote",
+      "demote"
+    ],
+    "public": [
+      "ping",
+      "menu",
+      "help",
+      "download",
+      "song",
+      "yt",
+      "ytmp3",
+      "gpt",
+      "ai",
+      "img",
+      "invite",
+      "link"
+    ]
+  },
+  "prefix": ".",
+  "modePublic": true,
+  "autoReplyCooldownMs": 1000000,
+  "maxFileSizeBytes": 26214400,
+  "botName": "D_GODFATHER",
+  "botStatus": "Online",
+  "startupMessage": "🤖 D_GODFATHER is online and ready!",
+  "youtubeSearchLimit": 5
+}
