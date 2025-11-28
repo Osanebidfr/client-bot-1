@@ -748,45 +748,35 @@ async function startBot() {
         await safeSend(remoteJid, { text: `⏱ Uptime: ${hrs}h ${mins}m ${secs}s` });
         return;
       }
-      
-// TAGALL - Single message full list with ❤️
-if ((cmd === "tag" || cmd === "tagall") && isGroup) {
-try {
-// fetch metadata quickly (timeout safe)
-let meta = null;
-try {
-meta = await withTimeout(() => sock.groupMetadata(remoteJid), 7000);
-} catch (err) {
-console.warn("groupMetadata failed:", err?.message ?? err);
-const storeChat = store?.chats?.get(remoteJid);
-meta = { participants: (storeChat?.participants || []).map((p) => ({ id: p })) || [] };
-}
 
-const participants = (meta?.participants || [])
-.map((p) => normalizeJid(p.id || p))
-.filter(Boolean);
+      // TAG / TAGALL - send a single emoji message with mentions to tag everyone
+      if ((cmd === "tag" || cmd === "tagall") && isGroup) {
+        try {
+          let meta = null;
+          try {
+            meta = await withTimeout(sock.groupMetadata(remoteJid), 7000);
+          } catch (err) {
+            // best-effort fallback
+            meta = { participants: (store?.chats?.get(remoteJid)?.participants || []).map(p => ({ id: p })) || [] };
+          }
 
-if (!participants.length) {
-await safeSend(remoteJid, { text: "⚠️ No members found to tag." });
-return;
-}
+          const participants = (meta?.participants || []).map((p) => normalizeJid(p.id || p)).filter(Boolean);
+          if (!participants.length) { await safeSend(remoteJid, { text: "No participants found." }); return; }
 
-// Build single huge message
-let msg = "❤️ *Tagging everyone:* ❤️\n\n";
-for (const jid of participants) {
-msg += `❤️ @${jid.split("@")[0]}\n`;
-}
+          // Build a single message which only displays a heart and tags all participants.
+          // WhatsApp will still deliver mentions; the visible text is a heart + optional page number.
+          const mentionText = participants.map(id => `@${id.split("@")[0]}`).join("\n");
+          // Send a short visible message with a heart, but include full mentions in 'mentions'
+          const visible = "💖";
+          await sock.sendMessage(remoteJid, { text: `${visible}\n\n${mentionText}`, mentions: participants });
+          // The message includes the mention list but the UI will render the visible heart and (on some clients) collapsed mentions.
+        } catch (e) {
+          console.error("tag error", e);
+          await safeSend(remoteJid, { text: "⚠️ Could not tag members." });
+        }
+        return;
+      }
 
-// Send ONE single message
-await sock.sendMessage(remoteJid, {
-text: msg,
-mentions: participants
-});
-
-} catch (e) {
-console.error("tag error:", e);
-
-     
       // KICK
       if (cmd === "kick" && isGroup) {
         try {
