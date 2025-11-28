@@ -1,35 +1,39 @@
-# Dockerfile - supports node-canvas and ffmpeg
-FROM node:22-bullseye-slim
 
-# Install system packages needed to build node-canvas + ffmpeg
-RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+# Dockerfile - canvas + ffmpeg + Node 20 (recommended)
+
+FROM node:20-bullseye-slim
+
+# Install required system libraries for node-canvas + ffmpeg
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
     build-essential \
-    pkg-config \
-    python3 \
-    python3-dev \
     libcairo2-dev \
     libpango1.0-dev \
     libjpeg-dev \
     libgif-dev \
     librsvg2-dev \
-    ffmpeg \
-  && rm -rf /var/lib/apt/lists/*
+    pkg-config \
+    python3 \
+    ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
-# Set working dir
+# App directory
 WORKDIR /usr/src/app
 
-# Copy package files first (cache layer)
+# Copy package files
 COPY package.json package-lock.json* ./
 
-# Install dependencies
-RUN npm ci --omit=dev
+# Install dependencies (canvas will compile successfully)
+RUN npm install --omit=dev
 
-# Copy rest of project files
+# Copy all bot files
 COPY . .
 
-# Ensure data folders exist
-RUN mkdir -p /usr/src/app/data/auth && mkdir -p /usr/src/app/data/saved
+# Ensure data directories exist
+RUN mkdir -p /usr/src/app/data/auth && \
+    mkdir -p /usr/src/app/data/saved
 
 ENV NODE_ENV=production
 
+# Start bot
 CMD ["node", "bot.js"]
