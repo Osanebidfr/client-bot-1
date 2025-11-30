@@ -95,6 +95,19 @@ function normalizeJid(jid) {
   } catch (e) { return jid; }
 }
 
+// ---------------- QR cooldown & helper (added) ----------------
+let lastQrShownAt = 0;
+const QR_COOLDOWN_MS = 90_000; // 90 seconds
+
+function showQrInConsole(qr) {
+  try {
+    qrcode.generate(qr, { small: true });
+    console.log("Scan QR (or open link): https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(qr));
+  } catch (err) {
+    console.log("QR: (unable to render ascii) use link: https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(qr));
+  }
+}
+
 // persist helpers
 const saveJson = (p, obj) => {
   try { fs.writeFileSync(p, JSON.stringify(obj, null, 2)); } catch (e) { console.warn("saveJson error", e?.message ?? e); }
@@ -233,16 +246,32 @@ async function startBot() {
   store.bind(sock.ev);
   sock.ev.on("creds.update", saveCreds);
 
+  // ensure creds updates are saved (extra guard)
+  sock.ev.on("creds.update", (creds) => {
+    try {
+      if (typeof saveCreds === "function") saveCreds(creds);
+      else try { fs.writeFileSync(path.join(DATA_DIR, "auth.json"), JSON.stringify(creds, null, 2)); } catch (_) {}
+    } catch (e) { console.warn("Could not persist creds update:", e?.message ?? e); }
+  });
+
   // connection.update: show QR + pairing code + owner checks
   sock.ev.on("connection.update", async (update) => {
     try {
       const { connection, lastDisconnect, qr, pairingCode } = update;
 
+      // QR handling with cooldown
       if (qr) {
-        console.log("\n===== QR CODE AVAILABLE =====");
-        qrcode.generate(qr, { small: true });
-        console.log("Scan QR via phone camera OR use link:");
-        console.log("https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(qr));
+        const now = Date.now();
+        const since = now - (lastQrShownAt || 0);
+        if (since < QR_COOLDOWN_MS) {
+          const wait = QR_COOLDOWN_MS - since;
+          console.log(`QR received but delaying display ${Math.ceil(wait/1000)}s to avoid rapid regen...`);
+          setTimeout(() => {
+            try { showQrInConsole(qr); lastQrShownAt = Date.now(); } catch(_) {}
+          }, wait);
+        } else {
+          try { showQrInConsole(qr); lastQrShownAt = Date.now(); } catch(_) {}
+        }
       }
 
       if (pairingCode) {
@@ -289,6 +318,19 @@ async function startBot() {
         const loggedOut = reason === DisconnectReason.loggedOut || reason === 401;
         console.warn("Connection closed. Reason:", reason, "loggedOut:", loggedOut);
         botReady = false;
+
+        // handle 'connectionReplaced' (440)
+        if (reason === DisconnectReason.connectionReplaced || reason === 440) {
+          console.error("⚠️ Session replaced (440): another session has taken over this account.");
+          try {
+            if (sock && typeof sock.logout === "function") {
+              await sock.logout().catch(()=>{});
+              console.log("Logged out after connectionReplaced.");
+            }
+          } catch (e) {}
+          console.log("Please stop other sessions or re-scan QR on the intended machine. Exiting now to avoid loops.");
+          process.exit(0); // let the platform / you decide next steps
+        }
 
         if (loggedOut) {
           console.error("Logged out. Delete ./data/auth and rescan QR / pairing code.");
@@ -355,30 +397,6 @@ async function startBot() {
       if (isBanned(authorJid)) {
         console.log("Sender banned:", authorJid);
         return;
-      }
-
-      // ---------- AUTO-REPLY (disabled if desired) ----------
-      // You said you want to remove auto-reply in final; leave simple toggle here:
-      if (!config.disableAutoReply) {
-        if (!isGroup) {
-          try {
-            if (!isOwner(authorJid)) {
-              // check if contact saved
-              const contacts = store.contacts || {};
-              const contact = contacts[authorJid] || contacts[normalizeJid(authorJid)];
-              const isSaved = !!(contact && (contact.name || contact.notify));
-
-              const last = contactCooldowns.get(authorJid) || 0;
-              const cooldown = config.autoReplyCooldownMs || 10 * 60 * 1000;
-              if (!isSaved && Date.now() - last >= cooldown) {
-                await safeSend(remoteJid, { text: "Hello 👋 — I am currently away. I will reply when possible." });
-                contactCooldowns.set(authorJid, Date.now());
-              }
-            }
-          } catch (e) {
-            console.warn("auto-reply check error:", e?.message ?? e);
-          }
-        }
       }
 
       // ---------- VIEW-ONCE automatic saving (send to chat and DM owner) ----------
@@ -748,30 +766,36 @@ async function startBot() {
         await safeSend(remoteJid, { text: `⏱ Uptime: ${hrs}h ${mins}m ${secs}s` });
         return;
       }
-
-      // TAG / TAGALL - send a single emoji message with mentions to tag everyone
+      
+      // ---------- TAGALL - Single message full list with ❤️ ----------
       if ((cmd === "tag" || cmd === "tagall") && isGroup) {
         try {
+          // attempt to fetch group metadata but don't block forever
           let meta = null;
           try {
-            meta = await withTimeout(sock.groupMetadata(remoteJid), 7000);
+            meta = await withTimeout(() => sock.groupMetadata(remoteJid), 7000);
           } catch (err) {
-            // best-effort fallback
+            console.warn("tag: groupMetadata timed out or failed:", err?.message ?? err);
+            // try best-effort to use store if available
             meta = { participants: (store?.chats?.get(remoteJid)?.participants || []).map(p => ({ id: p })) || [] };
           }
 
           const participants = (meta?.participants || []).map((p) => normalizeJid(p.id || p)).filter(Boolean);
-          if (!participants.length) { await safeSend(remoteJid, { text: "No participants found." }); return; }
+          if (!participants.length) {
+            await safeSend(remoteJid, { text: "⚠️ No members found to tag." });
+            return;
+          }
 
-          // Build a single message which only displays a heart and tags all participants.
-          // WhatsApp will still deliver mentions; the visible text is a heart + optional page number.
-          const mentionText = participants.map(id => `@${id.split("@")[0]}`).join("\n");
-          // Send a short visible message with a heart, but include full mentions in 'mentions'
-          const visible = "💖";
-          await sock.sendMessage(remoteJid, { text: `${visible}\n\n${mentionText}`, mentions: participants });
-          // The message includes the mention list but the UI will render the visible heart and (on some clients) collapsed mentions.
+          // Build single huge message
+          let msgText = "❤️ *Tagging everyone:* ❤️\n\n";
+          for (const jid of participants) {
+            msgText += `❤️ @${jid.split("@")[0]}\n`;
+          }
+
+          // Send ONE single message
+          await sock.sendMessage(remoteJid, { text: msgText, mentions: participants });
         } catch (e) {
-          console.error("tag error", e);
+          console.error("tag error:", e);
           await safeSend(remoteJid, { text: "⚠️ Could not tag members." });
         }
         return;
@@ -953,19 +977,21 @@ async function startBot() {
       if (cmd === "setstatusbot") { try { await requireOwner(); } catch { return; } if (!argStr) { await safeSend(remoteJid, { text: `Usage: ${prefix}setstatusbot <bio>` }); return; } config.botStatus = argStr; saveConfig(); await safeSend(remoteJid, { text: `✅ Bot status saved locally: ${argStr}` }); return; }
 
       if (cmd === "setppbot") {
-        try { await requireOwner(); } catch { return; }
-        const ctx = msg.message.extendedTextMessage?.contextInfo;
-        const quoted = ctx?.quotedMessage;
-        if (!quoted || !quoted.imageMessage) { await safeSend(remoteJid, { text: `Reply to an image with ${prefix}setppbot` }); return; }
         try {
-          const stream = await downloadContentFromMessage(quoted.imageMessage, "image");
-          const parts = [];
-          for await (const c of stream) parts.push(c);
-          const file = path.join(DATA_DIR, `ppbot_${Date.now()}.jpg`);
-          fs.writeFileSync(file, Buffer.concat(parts));
-          try { if (typeof sock.updateProfilePicture === "function") { await sock.updateProfilePicture(file); await safeSend(remoteJid, { text: "✅ Bot profile picture updated." }); } else { await safeSend(remoteJid, { text: `✅ Saved PP file locally: ${file}` }); } } catch (err) { console.warn("setppbot API error:", err?.message ?? err); await safeSend(remoteJid, { text: `✅ Saved PP file locally: ${file}` }); }
-          // preserve file for debugging (do not delete)
-        } catch (e) { console.error("setppbot error", e); await safeSend(remoteJid, { text: "⚠️ Failed to set profile picture." }); }
+          try { await requireOwner(); } catch { return; }
+          const ctx = msg.message.extendedTextMessage?.contextInfo;
+          const quoted = ctx?.quotedMessage;
+          if (!quoted || !quoted.imageMessage) { await safeSend(remoteJid, { text: `Reply to an image with ${prefix}setppbot` }); return; }
+          try {
+            const stream = await downloadContentFromMessage(quoted.imageMessage, "image");
+            const parts = [];
+            for await (const c of stream) parts.push(c);
+            const file = path.join(DATA_DIR, `ppbot_${Date.now()}.jpg`);
+            fs.writeFileSync(file, Buffer.concat(parts));
+            try { if (typeof sock.updateProfilePicture === "function") { await sock.updateProfilePicture(file); await safeSend(remoteJid, { text: "✅ Bot profile picture updated." }); } else { await safeSend(remoteJid, { text: `✅ Saved PP file locally: ${file}` }); } } catch (err) { console.warn("setppbot API error:", err?.message ?? err); await safeSend(remoteJid, { text: `✅ Saved PP file locally: ${file}` }); }
+            // preserve file for debugging (do not delete)
+          } catch (e) { console.error("setppbot error", e); await safeSend(remoteJid, { text: "⚠️ Failed to set profile picture." }); }
+        } catch (err) { console.error("setppbot outer error:", err); await safeSend(remoteJid, { text: "⚠️ Failed to run setppbot." }); }
         return;
       }
 
@@ -1227,26 +1253,64 @@ async function startBot() {
         return;
       }
 
-      // Sudo-only menu (show sudo commands)
-      if (cmd === "sudo") {
-        try { await requireSudo(); } catch { return; }
-        const sudoText = [
-          `*Sudo / Admin Commands*`,
-          ``,
-          `${prefix}setsudo <num> — add sudo`,
-          `${prefix}delsudo <num> — remove sudo`,
-          `${prefix}ban <num> — ban user`,
-          `${prefix}unban <num> — unban user`,
-          `${prefix}block <num> — block user`,
-          `${prefix}unblock <num> — unblock user`,
-        ].join("\n");
-        await safeSend(remoteJid, { text: sudoText });
-        return;
-      }
-
       // ---------- GAME SYSTEM ----------
       // game storage: games[groupJid] = { owner, name, participants: {jid:{name, score, active}}, rounds, timePerRound, currentRound, status, queue... }
       const ensureGame = (gid) => { if (!games[gid]) games[gid] = {}; return games[gid]; };
+      // .game menu/help — shows owner & players the game commands and rules
+if (cmd === "game" && (args[0] === "menu" || args[0] === "help" || argStr === "menu")) {
+  try {
+    const g = games[remoteJid] || {};
+    const t = [
+      `🎮 GAME — Quick Menu & Rules`,
+      ``,
+      `• Owner-only: create / start / stop the game.`,
+      ``,
+      `Commands (use ${config.prefix} as your prefix):`,
+      `${config.prefix}game create <name> <rounds> <timeSec> — Create a game (example: ${config.prefix}game create Quiz 10 15)`,
+      `${config.prefix}game join — Join the waiting game (group-only)`,
+      `${config.prefix}game start — Owner starts the game`,
+      `${config.prefix}game stop — Owner stops and finishes the game`,
+      `${config.prefix}game status — Show current scores & round`,
+      `${config.prefix}game menu — Show this help`,
+      ``,
+      `How to answer:`,
+      `• When a round starts the bot will post: Topic and required min letters.`,
+      `• Answer using: !s <your answer> (note: this works even without the prefix)`,
+      ``,
+      `Scoring & rules (current defaults):`,
+      `• Correct answer: +10 points`,
+      `• Rounds default: set when creating the game`,
+      `• Time per round: set when creating the game (seconds)`,
+      `• Elimination: after round 5, players with 0 points are removed automatically`,
+      ``,
+      `Tips for smooth running:`,
+      `• Owner should create the game in the group and announce join window.`,
+      `• Make sure at least 2 players join before starting.`,
+      `• Use shorter time per round for faster games, increase for longer words.`,
+      ``,
+      `Advanced:`,
+      `• Topics are selected from a default list (name, food, fruit, car, animal, school, city).`,
+      `• If you want custom topics or different scoring (deductions for wrong answers, auto-elimination rules), I can add owner-only config commands like: ${config.prefix}game settopics or ${config.prefix}game setrules.`,
+      ``,
+      `Example flow:`,
+      `1) Owner: ${config.prefix}game create RoadQuiz 10 15`,
+      `2) Players: ${config.prefix}game join`,
+      `3) Owner: ${config.prefix}game start`,
+      `4) Bot: Round 1 — Topic: food — !s <answer> — 15s`,
+      `5) Players: !s Apple`,
+      `6) Bot: accepted / points awarded`,
+      ``,
+      `Need any custom rules? Ask the owner to DM me with desired changes and I can add commands for them.`,
+    ].join("\n");
+
+    await safeSend(remoteJid, { text: t });
+  } catch (err) {
+    console.error("game menu error:", err);
+    await safeSend(remoteJid, { text: "⚠️ Failed to show game menu." });
+  }
+  return;
+}
+
 
       // .game create <name> <rounds> <timeSec>
       if (cmd === "game" && args[0] === "create") {
@@ -1444,6 +1508,15 @@ function jidFromNumber(num) {
   if (!n.includes("@")) n = `${n}@s.whatsapp.net`;
   return n;
 }
+
+// graceful logout on container stop (helps avoid stale sessions)
+const doCleanExit = async (sig) => {
+  console.log(`Signal ${sig} received: logging out and exiting...`);
+  try { if (sock && typeof sock.logout === "function") await sock.logout().catch(()=>{}); } catch (e) {}
+  process.exit(0);
+};
+process.on("SIGTERM", () => doCleanExit("SIGTERM"));
+process.on("SIGINT", () => doCleanExit("SIGINT"));
 
 // Start
 startBot().catch((err) => {
