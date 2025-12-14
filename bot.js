@@ -54,7 +54,7 @@ if (!fs.existsSync(PROFILES_FILE)) fs.writeFileSync(PROFILES_FILE, JSON.stringif
 
 // safe defaults config
 let config = {
-  owner: "2349065494753@s.whatsapp.net",
+  owner: "2348087054385@s.whatsapp.net",
   prefix: ".",
   modePublic: false,
   autoReplyCooldownMs: 10 * 60 * 1000,
@@ -94,8 +94,10 @@ function normalizeJid(jid) {
     return `${local}@${domain}`;
   } catch (e) { return jid; }
 }
+// ensure sock is declared in module scope, e.g.:
+// let sock = null;  // assigned later when you connect
 
-// ---------------- QR cooldown & helper (added) ----------------
+// ===== QR cooldown + helpers (add near top with other globals) =====
 let lastQrShownAt = 0;
 const QR_COOLDOWN_MS = 90_000; // 90 seconds
 
@@ -107,6 +109,49 @@ function showQrInConsole(qr) {
     console.log("QR: (unable to render ascii) use link: https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=" + encodeURIComponent(qr));
   }
 }
+
+// graceful logout on container stop (helps avoid stale sessions)
+async function doCleanExit(sig) {
+  console.log(`doCleanExit() called with signal: ${sig}`);
+  try {
+    if (sock) {
+      console.log("Attempting to logout sock...");
+      if (typeof sock.logout === "function") {
+        await sock.logout().catch(err => {
+          console.warn("sock.logout() failed:", err && err.message ? err.message : err);
+        });
+        console.log("sock.logout() finished");
+      } else {
+        console.log("sock.logout not available (not a function)");
+      }
+    } else {
+      console.log("sock is not defined or null");
+    }
+  } catch (err) {
+    console.warn("Error in doCleanExit cleanup:", err && err.message ? err.message : err);
+  } finally {
+    // give Node a short moment to flush logs and network before exiting
+    setTimeout(() => {
+      console.log("Exiting process now.");
+      process.exit(0);
+    }, 200);
+  }
+}
+
+// register once, avoid duplicate runs if multiple signals arrive
+process.once("SIGTERM", () => doCleanExit("SIGTERM"));
+process.once("SIGINT",  () => doCleanExit("SIGINT"));
+
+// optional: handle uncaught exceptions/rejections for safer shutdown
+process.once("uncaughtException", (err) => {
+  console.error("uncaughtException:", err && err.stack ? err.stack : err);
+  doCleanExit("uncaughtException");
+});
+process.once("unhandledRejection", (reason) => {
+  console.error("unhandledRejection:", reason);
+  doCleanExit("unhandledRejection");
+});
+
 
 // persist helpers
 const saveJson = (p, obj) => {
@@ -191,6 +236,22 @@ async function isBotAdminInGroup(groupJid) {
 const withTimeout = (p, ms = 7000) => {
   return Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms))]);
 };
+// helper: create a safe read stream (returns null if file missing) and prevent uncaught errors
+function safeCreateReadStream(filepath) {
+  try {
+    if (!fs.existsSync(filepath)) return null;
+    const rs = fs.createReadStream(filepath);
+    // attach an error handler so the stream never emits uncaught errors
+    rs.on("error", (err) => {
+      console.error("safeCreateReadStream error for", filepath, err?.message ?? err);
+      try { rs.destroy(); } catch (_) {}
+    });
+    return rs;
+  } catch (e) {
+    console.error("safeCreateReadStream failed:", e?.message ?? e);
+    return null;
+  }
+}
 
 // load games & profiles
 const loadJson = (p, fallback) => {
@@ -254,111 +315,115 @@ async function startBot() {
     } catch (e) { console.warn("Could not persist creds update:", e?.message ?? e); }
   });
 
-  // connection.update: show QR + pairing code + owner checks
-  sock.ev.on("connection.update", async (update) => {
-    try {
-      const { connection, lastDisconnect, qr, pairingCode } = update;
+ sock.ev.on("connection.update", async (update) => {
+  try {
+    const { connection, lastDisconnect, qr, pairingCode } = update;
 
-      // QR handling with cooldown
-      if (qr) {
-        const now = Date.now();
-        const since = now - (lastQrShownAt || 0);
-        if (since < QR_COOLDOWN_MS) {
-          const wait = QR_COOLDOWN_MS - since;
-          console.log(`QR received but delaying display ${Math.ceil(wait/1000)}s to avoid rapid regen...`);
-          setTimeout(() => {
-            try { showQrInConsole(qr); lastQrShownAt = Date.now(); } catch(_) {}
-          }, wait);
-        } else {
+    // QR handling with cooldown
+    if (qr) {
+      const now = Date.now();
+      const since = now - (lastQrShownAt || 0);
+      if (since < QR_COOLDOWN_MS) {
+        const wait = QR_COOLDOWN_MS - since;
+        console.log(`QR received, but delaying display ${Math.ceil(wait/1000)}s to avoid rapid regen...`);
+        setTimeout(() => {
           try { showQrInConsole(qr); lastQrShownAt = Date.now(); } catch(_) {}
-        }
+        }, wait);
+      } else {
+        try { showQrInConsole(qr); lastQrShownAt = Date.now(); } catch(_) {}
       }
-
-      if (pairingCode) {
-        try {
-          const codeStr = Array.isArray(pairingCode) ? pairingCode.join("-") : String(pairingCode);
-          console.log("\n===== PAIRING CODE AVAILABLE =====");
-          console.log("Enter this code on WhatsApp: 👉  " + codeStr);
-          console.log("This works on devices that show pairing flow.\n");
-        } catch (e) {}
-      }
-
-      if (connection === "open") {
-        console.log("✅ WhatsApp connection OPEN");
-
-        const loggedInJid = sock?.user?.id || (sock?.authState?.creds?.me?.id) || null;
-        console.log("Logged in as (socket JID):", loggedInJid);
-        console.log("Configured owner (config.owner):", config.owner);
-
-        if (loggedInJid && config.owner) {
-          const cleanLoggedIn = normalizeJid(loggedInJid);
-          const cleanOwner = normalizeJid(config.owner);
-          if (cleanLoggedIn !== cleanOwner) {
-            console.warn("⚠️ Owner mismatch: scanned account differs from config.owner (ignoring device suffixes).");
-            console.warn("If this login is for a client, update config.owner or set OWNER env var.");
-          } else {
-            console.log("✅ Owner match verified (device suffix ignored).");
-          }
-        }
-
-        if (!botReady) {
-          botReady = true;
-          try {
-            const notifyTarget = (loggedInJid && normalizeJid(loggedInJid) === normalizeJid(config.owner)) ? config.owner : (loggedInJid || config.owner);
-            await safeSend(notifyTarget, { text: `🤖 ${config.botName || "JohnBot"} is online and ready!` });
-          } catch (e) {
-            console.warn("Failed to notify owner:", e?.message ?? e);
-          }
-        }
-        return;
-      }
-
-      if (connection === "close") {
-        const reason = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = reason === DisconnectReason.loggedOut || reason === 401;
-        console.warn("Connection closed. Reason:", reason, "loggedOut:", loggedOut);
-        botReady = false;
-
-        // handle 'connectionReplaced' (440)
-        if (reason === DisconnectReason.connectionReplaced || reason === 440) {
-          console.error("⚠️ Session replaced (440): another session has taken over this account.");
-          try {
-            if (sock && typeof sock.logout === "function") {
-              await sock.logout().catch(()=>{});
-              console.log("Logged out after connectionReplaced.");
-            }
-          } catch (e) {}
-          console.log("Please stop other sessions or re-scan QR on the intended machine. Exiting now to avoid loops.");
-          process.exit(0); // let the platform / you decide next steps
-        }
-
-        if (loggedOut) {
-          console.error("Logged out. Delete ./data/auth and rescan QR / pairing code.");
-          try { await safeSend(config.owner, { text: "❌ Bot logged out. Please rescan QR and restart." }); } catch (_) {}
-          return;
-        }
-
-        if (!reconnecting) {
-          reconnecting = true;
-          console.log("Attempt reconnect in 3s...");
-          setTimeout(async () => {
-            try {
-              try { sock.ev.removeAllListeners(); } catch (e) {}
-              sock = null;
-              await startBot();
-            } catch (e) {
-              console.error("Reconnect failed:", e?.message ?? e);
-            } finally { reconnecting = false; }
-          }, 3000);
-        } else {
-          console.log("Already reconnecting, skipping spawn.");
-        }
-        return;
-      }
-    } catch (e) {
-      console.error("connection.update handler error:", e?.message ?? e);
     }
-  });
+
+    // pairing code (8-digit style)
+    if (pairingCode) {
+      try {
+        const codeStr = Array.isArray(pairingCode) ? pairingCode.join("-") : String(pairingCode);
+        console.log("\n===== PAIRING CODE AVAILABLE =====");
+        console.log("Enter this code on WhatsApp: 👉  " + codeStr);
+        console.log("This works on devices that show pairing flow.\n");
+      } catch (e) {}
+    }
+
+    // Connection OPEN
+    if (connection === "open") {
+      console.log("✅ WhatsApp connection OPEN");
+
+      const loggedInJid = sock?.user?.id || (sock?.authState?.creds?.me?.id) || null;
+      console.log("Logged in as (socket JID):", loggedInJid);
+      console.log("Configured owner (config.owner):", config.owner);
+
+      if (loggedInJid && config.owner) {
+        const cleanLoggedIn = normalizeJid(loggedInJid);
+        const cleanOwner = normalizeJid(config.owner);
+        if (cleanLoggedIn !== cleanOwner) {
+          console.warn("⚠️ Owner mismatch: scanned account differs from config.owner (ignoring device suffixes).");
+          console.warn("If this login is for a client, update config.owner or set OWNER env var.");
+        } else {
+          console.log("✅ Owner match verified (device suffix ignored).");
+        }
+      }
+
+      if (!botReady) {
+        botReady = true;
+        try {
+          const notifyTarget = (loggedInJid && normalizeJid(loggedInJid) === normalizeJid(config.owner)) ? config.owner : (loggedInJid || config.owner);
+          await safeSend(notifyTarget, { text: `🤖 ${config.botName || "JohnBot"} is online and ready!` });
+        } catch (e) {
+          console.warn("Failed to notify owner:", e?.message ?? e);
+        }
+      }
+      return;
+    }
+
+    // Connection CLOSED
+    if (connection === "close") {
+      const reason = lastDisconnect?.error?.output?.statusCode;
+      const loggedOut = reason === DisconnectReason.loggedOut || reason === 401;
+      console.warn("Connection closed. Reason:", reason, "loggedOut:", loggedOut);
+      botReady = false;
+
+      // handle 'connectionReplaced' (440)
+      if (reason === DisconnectReason.connectionReplaced || reason === 440) {
+        console.error("⚠️ Session replaced (440): another session has taken over this account.");
+        try {
+          if (sock && typeof sock.logout === "function") {
+            await sock.logout().catch(()=>{});
+            console.log("Logged out after connectionReplaced.");
+          }
+        } catch (e) {}
+        console.log("Please stop other sessions or re-scan QR on the intended machine. Exiting now to avoid loops.");
+        process.exit(0);
+      }
+
+      if (loggedOut) {
+        console.error("Logged out. Delete ./data/auth and rescan QR / pairing code.");
+        try { await safeSend(config.owner, { text: "❌ Bot logged out. Please rescan QR and restart." }); } catch (_) {}
+        return;
+      }
+
+      // reconnect/backoff
+      if (!reconnecting) {
+        reconnecting = true;
+        console.log("Attempt reconnect in 3s...");
+        setTimeout(async () => {
+          try {
+            try { sock.ev.removeAllListeners(); } catch (e) {}
+            sock = null;
+            await startBot();
+          } catch (e) {
+            console.error("Reconnect failed:", e?.message ?? e);
+          } finally { reconnecting = false; }
+        }, 3000);
+      } else {
+        console.log("Already reconnecting, skipping spawn.");
+      }
+      return;
+    }
+  } catch (e) {
+    console.error("connection.update handler error:", e?.message ?? e);
+  }
+});
+
 
   // messages.upsert - main handler
   sock.ev.on("messages.upsert", async ({ messages }) => {
@@ -488,254 +553,263 @@ async function startBot() {
         return;
       }
 
-      // MENU - enhanced (thumbnail banner / profile pic / fallback text)
-      if (cmd === "menu") {
+    // MENU - enhanced (thumbnail banner / profile pic / fallback text)
+if (cmd === "menu") {
+  try {
+    // target can be mentioned or replied-to participant
+    const ctx = msg.message.extendedTextMessage?.contextInfo;
+    const target = ctx?.participant || ctx?.mentionedJid?.[0] || authorJid;
+    const contactObject = (store.contacts && (store.contacts[target] || store.contacts[normalizeJid(target)])) || {};
+    const displayName = contactObject?.name || contactObject?.notify || target.split("@")[0];
+
+    // basic menu text
+    const header = "════════════════════════";
+    const menuText = [
+      `*🤖 ${config.botName || "JohnBot"} — Menu*`,
+      ``,
+      `*👤 Name:* ${displayName}`,
+      `*🆔 JID:* ${target}`,
+      `*🏷 Group:* ${isGroup ? "Yes" : "No"}`,
+      `*🔒 Mode:* ${config.modePublic ? "Public" : "Private"}`,
+      ``,
+      `*Commands*`,
+      `${prefix}ping — check latency`,
+      `${prefix}menu — show this menu`,
+      `${prefix}download — reply to media to save and resend`,
+      `${prefix}song <query> — download YouTube audio`,
+      `${prefix}view — retrieve view-once media`,
+      `${prefix}gpt <prompt> — ChatGPT/Images`,
+      `${prefix}sticker — reply to image/video to create a sticker`,
+      `${prefix}sudo — sudo-only menu`,
+      ``,
+      `*Owner:* ${config.owner}`,
+      header,
+      `_Powered by ${config.botName}_`,
+    ].join("\n");
+
+    // try to include profile pic
+    let ppUrl = null;
+    try { ppUrl = await sock.profilePictureUrl(target).catch(() => null); } catch (e) { ppUrl = null; }
+
+    // Attempt to generate a colorful banner using canvas dynamically (in-memory)
+    let sent = false;
+    try {
+      const canvasModule = await import("canvas").catch(() => null);
+      if (canvasModule && canvasModule.createCanvas) {
+        const { createCanvas, loadImage } = canvasModule;
+        const width = 1200, height = 600;
+        const canvas = createCanvas(width, height);
+        const ctx2 = canvas.getContext("2d");
+
+        // gradient background
+        const g = ctx2.createLinearGradient(0, 0, width, height);
+        g.addColorStop(0, "#ff9a9e");
+        g.addColorStop(0.5, "#fad0c4");
+        g.addColorStop(1, "#fad0c4");
+        ctx2.fillStyle = g;
+        ctx2.fillRect(0, 0, width, height);
+
+        // header
+        ctx2.fillStyle = "#fff";
+        ctx2.font = "bold 48px Sans-serif";
+        ctx2.fillText(`${config.botName || "JohnBot"} — Menu`, 60, 120);
+
+        // small card for user
+        ctx2.fillStyle = "rgba(255,255,255,0.08)";
+        ctx2.fillRect(60, 160, 1080, 360);
+
+        // avatar
+        const avatarSize = 220;
         try {
-          // target can be mentioned or replied-to participant
-          const ctx = msg.message.extendedTextMessage?.contextInfo;
-          const target = ctx?.participant || ctx?.mentionedJid?.[0] || authorJid;
-          const contactObject = (store.contacts && (store.contacts[target] || store.contacts[normalizeJid(target)])) || {};
-          const displayName = contactObject?.name || contactObject?.notify || target.split("@")[0];
-
-          // basic menu text
-          const header = "════════════════════════";
-          const menuText = [
-            `*🤖 ${config.botName || "JohnBot"} — Menu*`,
-            ``,
-            `*👤 Name:* ${displayName}`,
-            `*🆔 JID:* ${target}`,
-            `*🏷 Group:* ${isGroup ? "Yes" : "No"}`,
-            `*🔒 Mode:* ${config.modePublic ? "Public" : "Private"}`,
-            ``,
-            `*Commands*`,
-            `${prefix}ping — check latency`,
-            `${prefix}menu — show this menu`,
-            `${prefix}download — reply to media to save and resend`,
-            `${prefix}song <query> — download YouTube audio`,
-            `${prefix}view — retrieve view-once media`,
-            `${prefix}gpt <prompt> — ChatGPT/Images`,
-            `${prefix}sticker — reply to image/video to create a sticker`,
-            `${prefix}sudo — sudo-only menu`,
-            ``,
-            `*Owner:* ${config.owner}`,
-            header,
-            `_Powered by ${config.botName}_`,
-          ].join("\n");
-
-          // try to include profile pic
-          let ppUrl = null;
-          try { ppUrl = await sock.profilePictureUrl(target).catch(() => null); } catch (e) { ppUrl = null; }
-
-          // Attempt to generate a colorful banner using canvas dynamically
-          let sent = false;
-          try {
-            const canvasModule = await import("canvas").catch(() => null);
-            if (canvasModule && canvasModule.createCanvas) {
-              const { createCanvas, loadImage } = canvasModule;
-              const width = 1200, height = 600;
-              const canvas = createCanvas(width, height);
-              const ctx2 = canvas.getContext("2d");
-
-              // gradient background
-              const g = ctx2.createLinearGradient(0, 0, width, height);
-              g.addColorStop(0, "#ff9a9e");
-              g.addColorStop(0.5, "#fad0c4");
-              g.addColorStop(1, "#fad0c4");
-              ctx2.fillStyle = g;
-              ctx2.fillRect(0, 0, width, height);
-
-              // header
-              ctx2.fillStyle = "#fff";
-              ctx2.font = "bold 48px Sans-serif";
-              ctx2.fillText(`${config.botName || "JohnBot"} — Menu`, 60, 120);
-
-              // small card for user
-              ctx2.fillStyle = "rgba(255,255,255,0.08)";
-              ctx2.fillRect(60, 160, 1080, 360);
-
-              // avatar
-              const avatarSize = 220;
-              try {
-                if (ppUrl) {
-                  const img = await loadImage(ppUrl);
-                  // circle mask
-                  ctx2.save();
-                  ctx2.beginPath();
-                  ctx2.arc(160 + avatarSize / 2, 160 + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
-                  ctx2.closePath();
-                  ctx2.clip();
-                  ctx2.drawImage(img, 160, 160, avatarSize, avatarSize);
-                  ctx2.restore();
-                } else {
-                  ctx2.fillStyle = "#ffffff22";
-                  ctx2.beginPath();
-                  ctx2.arc(160 + avatarSize / 2, 160 + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
-                  ctx2.fill();
-                }
-              } catch (e) {}
-
-              // text details
-              ctx2.fillStyle = "#fff";
-              ctx2.font = "bold 36px Sans-serif";
-              ctx2.fillText(displayName, 420, 230);
-              ctx2.font = "20px Sans-serif";
-              ctx2.fillText(`JID: ${target}`, 420, 270);
-              ctx2.fillText(`Mode: ${config.modePublic ? "Public" : "Private"}`, 420, 300);
-
-              const outPath = path.join(DATA_DIR, `menu_${Date.now()}.png`);
-              fs.writeFileSync(outPath, canvas.toBuffer("image/png"));
-              await safeSend(remoteJid, { image: fs.createReadStream(outPath), caption: menuText });
-              try { fs.unlinkSync(outPath); } catch (e) {}
-              sent = true;
-            }
-          } catch (e) {
-            console.warn("canvas menu generation failed:", e?.message ?? e);
-          }
-
-          // fallback to banner image with caption or just text
-          if (!sent) {
-            const bannerUrl = "https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?auto=format&fit=crop&w=1200&q=80";
-            try {
-              await safeSend(remoteJid, { image: { url: bannerUrl }, caption: menuText });
-              sent = true;
-            } catch (e) { /* ignore */ }
-          }
-          if (!sent) {
-            await safeSend(remoteJid, { text: menuText });
+          if (ppUrl) {
+            const img = await loadImage(ppUrl);
+            // circle mask
+            ctx2.save();
+            ctx2.beginPath();
+            ctx2.arc(160 + avatarSize / 2, 160 + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
+            ctx2.closePath();
+            ctx2.clip();
+            ctx2.drawImage(img, 160, 160, avatarSize, avatarSize);
+            ctx2.restore();
+          } else {
+            ctx2.fillStyle = "#ffffff22";
+            ctx2.beginPath();
+            ctx2.arc(160 + avatarSize / 2, 160 + avatarSize / 2, avatarSize / 2, 0, Math.PI * 2);
+            ctx2.fill();
           }
         } catch (e) {
-          console.error("menu error", e);
-          await safeSend(remoteJid, { text: "⚠️ Failed to fetch user menu." });
+          // ignore avatar load errors and continue
         }
-        return;
-      }
 
-      // SUBMENU: .menu user (profile card)
-      if (cmd === "menu" && (argStr.startsWith("user") || argStr === "profile" || argStr === "submenu" || argStr.startsWith("user "))) {
-        // reuse logic from earlier but produce a concise profile card; for brevity reuse same code path as .menu above
-        // (implementation intentionally similar)
+        // text details
+        ctx2.fillStyle = "#fff";
+        ctx2.font = "bold 36px Sans-serif";
+        ctx2.fillText(displayName, 420, 230);
+        ctx2.font = "20px Sans-serif";
+        ctx2.fillText(`JID: ${target}`, 420, 270);
+        ctx2.fillText(`Mode: ${config.modePublic ? "Public" : "Private"}`, 420, 300);
+
+        // send directly from memory (avoid file creation)
         try {
-          const ctx = msg.message.extendedTextMessage?.contextInfo;
-          // determine target
-          let target = ctx?.participant || ctx?.mentionedJid?.[0] || authorJid;
-          target = normalizeJid(target);
-          const contactEntry = (store.contacts && (store.contacts[target] || store.contacts[normalizeJid(target)])) || {};
-          const displayName = contactEntry?.name || contactEntry?.notify || target.split("@")[0];
-          let joined = "—", role = "Member";
-
-          if (isGroup) {
-            try {
-              const meta = await sock.groupMetadata(remoteJid);
-              const participant = meta.participants.find((p) => normalizeJid(p.id) === normalizeJid(target));
-              if (participant) {
-                if (participant.joinedTimestamp) joined = new Date(participant.joinedTimestamp).toLocaleString("en-GB", { timeZone: "Africa/Lagos" });
-                if (participant.admin || participant.isAdmin || participant.isSuperAdmin) role = "Admin";
-              }
-            } catch (e) {}
-          }
-
-          let ppUrl = null;
-          try { ppUrl = await sock.profilePictureUrl(target).catch(() => null); } catch (e) {}
-
-          // try canvas as before
-          let sent = false;
-          try {
-            const canvasModule = await import("canvas").catch(() => null);
-            if (canvasModule && canvasModule.createCanvas) {
-              const { createCanvas, loadImage } = canvasModule;
-              const width = 900, height = 450;
-              const canvas = createCanvas(width, height);
-              const ctx2 = canvas.getContext("2d");
-              // gradient
-              const g = ctx2.createLinearGradient(0, 0, width, height);
-              g.addColorStop(0, "#ff7eb3");
-              g.addColorStop(0.5, "#7ac7ff");
-              g.addColorStop(1, "#9d7aff");
-              ctx2.fillStyle = g;
-              ctx2.fillRect(0, 0, width, height);
-
-              // card overlay
-              ctx2.fillStyle = "rgba(255,255,255,0.06)";
-              ctx2.fillRect(30, 30, width - 60, height - 60);
-
-              // avatar
-              const avatarSize = 180, avatarX = 50, avatarY = 60;
-              if (ppUrl) {
-                try {
-                  const img = await loadImage(ppUrl);
-                  ctx2.save();
-                  ctx2.beginPath();
-                  ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
-                  ctx2.closePath();
-                  ctx2.clip();
-                  ctx2.drawImage(img, avatarX, avatarY, avatarSize, avatarSize);
-                  ctx2.restore();
-                } catch (e) {
-                  ctx2.fillStyle = "#ffffff22";
-                  ctx2.beginPath();
-                  ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
-                  ctx2.fill();
-                }
-              } else {
-                ctx2.fillStyle = "#ffffff22";
-                ctx2.beginPath();
-                ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
-                ctx2.fill();
-                ctx2.fillStyle = "#fff";
-                ctx2.font = "bold 48px Sans-serif";
-                const initials = (displayName.split(" ").map(s => s[0]).slice(0,2).join("") || displayName.slice(0,2)).toUpperCase();
-                ctx2.textAlign = "center";
-                ctx2.fillText(initials, avatarX + avatarSize/2, avatarY + avatarSize/2 + 18);
-              }
-
-              ctx2.fillStyle = "#fff";
-              ctx2.font = "bold 34px Sans-serif";
-              ctx2.textAlign = "left";
-              ctx2.fillText(displayName, avatarX + avatarSize + 30, avatarY + 60);
-              ctx2.font = "20px Sans-serif";
-              ctx2.fillStyle = "#f3f3f3";
-              ctx2.fillText(`JID: ${target}`, avatarX + avatarSize + 30, avatarY + 100);
-              ctx2.fillText(`Saved contact: ${contactEntry?.name ? "Yes" : "No"}`, avatarX + avatarSize + 30, avatarY + 140);
-              ctx2.fillText(`Role: ${role}`, avatarX + avatarSize + 30, avatarY + 170);
-              ctx2.fillText(`Joined: ${isGroup ? joined : "Private Chat"}`, avatarX + avatarSize + 30, avatarY + 200);
-
-              const outPath = path.join(DATA_DIR, `menu_user_${Date.now()}.png`);
-              fs.writeFileSync(outPath, canvas.toBuffer("image/png"));
-              await safeSend(remoteJid, { image: fs.createReadStream(outPath), caption: `🔎 Profile — ${displayName}` });
-              try { fs.unlinkSync(outPath); } catch (e) {}
-              sent = true;
-            }
-          } catch (e) {
-            console.warn("canvas submenu failed:", e?.message ?? e);
-          }
-
-          if (!sent) {
-            if (ppUrl) {
-              try {
-                await safeSend(remoteJid, { image: { url: ppUrl }, caption:
-                  `🔎 Profile — ${displayName}\nJID: ${target}\nSaved contact: ${contactEntry?.name ? "Yes" : "No"}\nRole: ${role}\nJoined: ${isGroup ? joined : "Private Chat"}`
-                });
-                sent = true;
-              } catch (e) {}
-            }
-          }
-
-          if (!sent) {
-            const summary = [
-              `🔎 Profile — ${displayName}`,
-              `JID: ${target}`,
-              `Saved contact: ${contactEntry?.name ? "Yes" : "No"}`,
-              `Role: ${role}`,
-              `Joined: ${isGroup ? joined : "Private Chat"}`,
-            ].join("\n");
-            await safeSend(remoteJid, { text: summary });
-          }
-        } catch (err) {
-          console.error("submenu menu user error:", err);
-          await safeSend(remoteJid, { text: "⚠️ Failed to create user submenu." });
+          const buffer = canvas.toBuffer("image/png");
+          await safeSend(remoteJid, { image: buffer, caption: menuText });
+          sent = true;
+        } catch (sendErr) {
+          console.warn("menu: failed to send generated image buffer, falling back:", sendErr?.message ?? sendErr);
+          sent = false;
         }
-        return;
       }
+    } catch (e) {
+      console.warn("canvas menu generation failed (in-memory):", e?.message ?? e);
+    }
+
+    // fallback to banner image with caption or just text
+    if (!sent) {
+      const bannerUrl = "https://images.unsplash.com/photo-1517245386807-bb43f82c33c4?auto=format&fit=crop&w=1200&q=80";
+      try {
+        await safeSend(remoteJid, { image: { url: bannerUrl }, caption: menuText });
+        sent = true;
+      } catch (e) { /* ignore */ }
+    }
+    if (!sent) {
+      await safeSend(remoteJid, { text: menuText });
+    }
+  } catch (e) {
+    console.error("menu error", e);
+    await safeSend(remoteJid, { text: "⚠️ Failed to fetch user menu." });
+  }
+  return;
+}
+
+     // SUBMENU: .menu user (profile card)
+if (cmd === "menu" && (argStr.startsWith("user") || argStr === "profile" || argStr === "submenu" || argStr.startsWith("user "))) {
+  try {
+    const ctx = msg.message.extendedTextMessage?.contextInfo;
+    // determine target
+    let target = ctx?.participant || ctx?.mentionedJid?.[0] || authorJid;
+    target = normalizeJid(target);
+    const contactEntry = (store.contacts && (store.contacts[target] || store.contacts[normalizeJid(target)])) || {};
+    const displayName = contactEntry?.name || contactEntry?.notify || target.split("@")[0];
+    let joined = "—", role = "Member";
+
+    if (isGroup) {
+      try {
+        const meta = await sock.groupMetadata(remoteJid);
+        const participant = meta.participants.find((p) => normalizeJid(p.id) === normalizeJid(target));
+        if (participant) {
+          if (participant.joinedTimestamp) joined = new Date(participant.joinedTimestamp).toLocaleString("en-GB", { timeZone: "Africa/Lagos" });
+          if (participant.admin || participant.isAdmin || participant.isSuperAdmin) role = "Admin";
+        }
+      } catch (e) {}
+    }
+
+    let ppUrl = null;
+    try { ppUrl = await sock.profilePictureUrl(target).catch(() => null); } catch (e) {}
+
+    // try canvas profile card in-memory
+    let sent = false;
+    try {
+      const canvasModule = await import("canvas").catch(() => null);
+      if (canvasModule && canvasModule.createCanvas) {
+        const { createCanvas, loadImage } = canvasModule;
+        const width = 900, height = 450;
+        const canvas = createCanvas(width, height);
+        const ctx2 = canvas.getContext("2d");
+        // gradient
+        const g = ctx2.createLinearGradient(0, 0, width, height);
+        g.addColorStop(0, "#ff7eb3");
+        g.addColorStop(0.5, "#7ac7ff");
+        g.addColorStop(1, "#9d7aff");
+        ctx2.fillStyle = g;
+        ctx2.fillRect(0, 0, width, height);
+
+        // card overlay
+        ctx2.fillStyle = "rgba(255,255,255,0.06)";
+        ctx2.fillRect(30, 30, width - 60, height - 60);
+
+        // avatar
+        const avatarSize = 180, avatarX = 50, avatarY = 60;
+        if (ppUrl) {
+          try {
+            const img = await loadImage(ppUrl);
+            ctx2.save();
+            ctx2.beginPath();
+            ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
+            ctx2.closePath();
+            ctx2.clip();
+            ctx2.drawImage(img, avatarX, avatarY, avatarSize, avatarSize);
+            ctx2.restore();
+          } catch (e) {
+            ctx2.fillStyle = "#ffffff22";
+            ctx2.beginPath();
+            ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
+            ctx2.fill();
+          }
+        } else {
+          ctx2.fillStyle = "#ffffff22";
+          ctx2.beginPath();
+          ctx2.arc(avatarX + avatarSize/2, avatarY + avatarSize/2, avatarSize/2, 0, Math.PI*2);
+          ctx2.fill();
+          ctx2.fillStyle = "#fff";
+          ctx2.font = "bold 48px Sans-serif";
+          const initials = (displayName.split(" ").map(s => s[0]).slice(0,2).join("") || displayName.slice(0,2)).toUpperCase();
+          ctx2.textAlign = "center";
+          ctx2.fillText(initials, avatarX + avatarSize/2, avatarY + avatarSize/2 + 18);
+        }
+
+        ctx2.fillStyle = "#fff";
+        ctx2.font = "bold 34px Sans-serif";
+        ctx2.textAlign = "left";
+        ctx2.fillText(displayName, avatarX + avatarSize + 30, avatarY + 60);
+        ctx2.font = "20px Sans-serif";
+        ctx2.fillStyle = "#f3f3f3";
+        ctx2.fillText(`JID: ${target}`, avatarX + avatarSize + 30, avatarY + 100);
+        ctx2.fillText(`Saved contact: ${contactEntry?.name ? "Yes" : "No"}`, avatarX + avatarSize + 30, avatarY + 140);
+        ctx2.fillText(`Role: ${role}`, avatarX + avatarSize + 30, avatarY + 170);
+        ctx2.fillText(`Joined: ${isGroup ? joined : "Private Chat"}`, avatarX + avatarSize + 30, avatarY + 200);
+
+        // send from memory
+        try {
+          const buffer = canvas.toBuffer("image/png");
+          await safeSend(remoteJid, { image: buffer, caption: `🔎 Profile — ${displayName}` });
+          sent = true;
+        } catch (sendErr) {
+          console.warn("submenu: failed to send generated profile image buffer, falling back:", sendErr?.message ?? sendErr);
+          sent = false;
+        }
+      }
+    } catch (e) {
+      console.warn("canvas submenu failed (in-memory):", e?.message ?? e);
+    }
+
+    if (!sent) {
+      if (ppUrl) {
+        try {
+          await safeSend(remoteJid, { image: { url: ppUrl }, caption:
+            `🔎 Profile — ${displayName}\nJID: ${target}\nSaved contact: ${contactEntry?.name ? "Yes" : "No"}\nRole: ${role}\nJoined: ${isGroup ? joined : "Private Chat"}`
+          });
+          sent = true;
+        } catch (e) { /* ignore */ }
+      }
+    }
+
+    if (!sent) {
+      const summary = [
+        `🔎 Profile — ${displayName}`,
+        `JID: ${target}`,
+        `Saved contact: ${contactEntry?.name ? "Yes" : "No"}`,
+        `Role: ${role}`,
+        `Joined: ${isGroup ? joined : "Private Chat"}`,
+      ].join("\n");
+      await safeSend(remoteJid, { text: summary });
+    }
+  } catch (err) {
+    console.error("submenu menu user error:", err);
+    await safeSend(remoteJid, { text: "⚠️ Failed to create user submenu." });
+  }
+  return;
+}
+
 
       // HELP
       if (cmd === "help") {
@@ -766,41 +840,48 @@ async function startBot() {
         await safeSend(remoteJid, { text: `⏱ Uptime: ${hrs}h ${mins}m ${secs}s` });
         return;
       }
+      // TAGALL - Single message full list with ❤️
+if ((cmd === "tag" || cmd === "tagall") && isGroup) {
+  try {
+    // attempt to fetch group metadata but don't block forever
+    let meta = null;
+    try {
+      meta = await withTimeout(() => sock.groupMetadata(remoteJid), 7000);
+    } catch (err) {
+      console.warn("tag: groupMetadata timed out or failed:", err?.message ?? err);
+      // best-effort fallback to store (may be empty)
+      const storeChat = store?.chats?.get(remoteJid);
+      meta = { participants: (storeChat?.participants || []).map((p) => ({ id: p })) || [] };
+    }
+
+    const participants = (meta?.participants || [])
+      .map((p) => normalizeJid(p.id || p))
+      .filter(Boolean);
+
+    if (!participants.length) {
+      await safeSend(remoteJid, { text: "⚠️ No members found to tag." });
+      return;
+    }
+
+    // Build single huge message
+    let msg = "❤️ *Tagging everyone:* ❤️\n\n";
+    for (const jid of participants) {
+      msg += `❤️ @${jid.split("@")[0]}\n`;
+    }
+
+    // Send ONE single message (mentions array)
+    await sock.sendMessage(remoteJid, {
+      text: msg,
+      mentions: participants
+    });
+  } catch (e) {
+    console.error("tag error", e);
+    await safeSend(remoteJid, { text: "⚠️ Could not tag members." });
+  }
+  return;
+}
+
       
-      // ---------- TAGALL - Single message full list with ❤️ ----------
-      if ((cmd === "tag" || cmd === "tagall") && isGroup) {
-        try {
-          // attempt to fetch group metadata but don't block forever
-          let meta = null;
-          try {
-            meta = await withTimeout(() => sock.groupMetadata(remoteJid), 7000);
-          } catch (err) {
-            console.warn("tag: groupMetadata timed out or failed:", err?.message ?? err);
-            // try best-effort to use store if available
-            meta = { participants: (store?.chats?.get(remoteJid)?.participants || []).map(p => ({ id: p })) || [] };
-          }
-
-          const participants = (meta?.participants || []).map((p) => normalizeJid(p.id || p)).filter(Boolean);
-          if (!participants.length) {
-            await safeSend(remoteJid, { text: "⚠️ No members found to tag." });
-            return;
-          }
-
-          // Build single huge message
-          let msgText = "❤️ *Tagging everyone:* ❤️\n\n";
-          for (const jid of participants) {
-            msgText += `❤️ @${jid.split("@")[0]}\n`;
-          }
-
-          // Send ONE single message
-          await sock.sendMessage(remoteJid, { text: msgText, mentions: participants });
-        } catch (e) {
-          console.error("tag error:", e);
-          await safeSend(remoteJid, { text: "⚠️ Could not tag members." });
-        }
-        return;
-      }
-
       // KICK
       if (cmd === "kick" && isGroup) {
         try {
